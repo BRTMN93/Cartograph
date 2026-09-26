@@ -360,7 +360,9 @@ void UCartographGameInstanceModule::RedrawMap(bool bRedrawEntirely)
 {
 	if (!Coroutine.IsDone())
 	{
-		if (!IsInitializing)
+		// An entire redraw isn't restarted for a building change, the change gets drawn right after it instead.
+		// Otherwise building something every few seconds would keep the map from ever finishing.
+		if (!IsInitializing && (bRedrawEntirely || !IsRedrawingEntirely))
 		{
 			CARTO_LOG_DEBUG("RedrawMapCoroutine Cancel Requested");
 			Coroutine.Cancel();
