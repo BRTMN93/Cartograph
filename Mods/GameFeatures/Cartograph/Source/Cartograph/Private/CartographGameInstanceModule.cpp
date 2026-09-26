@@ -1,7 +1,5 @@
 ﻿#include "CartographGameInstanceModule.h"
 
-#include <sstream>
-
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "CanvasItem.h"
 #include "Components/CanvasPanelSlot.h"
@@ -323,6 +321,14 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 			[](auto& Scope, FCanvas* ClassInstance,
 				FCanvas::EElementType InElementType, FBatchedElementParameters* InBatchedElementParameters, const FTexture* InTexture, ESimpleElementBlendMode InBlendMode, const FDepthFieldGlowInfo& GlowInfo, bool bApplyDPIScale)
 			{
+				// Only Cartograph's map canvas needs the custom render item (for the redraw scissor).
+				// Every other canvas must keep the engine implementation, otherwise its render data leaks VRAM.
+				if (!Instance || ClassInstance != Instance->CurrentCanvas)
+				{
+					Scope(ClassInstance, InElementType, InBatchedElementParameters, InTexture, InBlendMode, GlowInfo, bApplyDPIScale);
+					return;
+				}
+
 				// get sort element based on the current sort key from top of sort key stack
 				FCanvas::FCanvasSortElement& SortElement = ClassInstance->GetSortElement(ClassInstance->TopDepthSortKey());
 				// find a batch to use 
@@ -441,7 +447,8 @@ void UCartographGameInstanceModule::RedrawMap(bool bRedrawEntirely)
 			CARTO_LOG_DEBUG("RedrawMapCoroutine Cancel Requested");
 			Coroutine.Cancel();
 		}
-        IsPendingRedrawEntire = bRedrawEntirely;
+		// Don't let a later partial redraw request drop a pending entire one
+        IsPendingRedrawEntire |= bRedrawEntirely;
 		IsPendingRedraw = true;
 	}
 	else if (!IsClient || !IsInitializing)
@@ -538,6 +545,7 @@ UE5Coro::TCoroutine<> UCartographGameInstanceModule::InitialBuildableGather(
 
 	IsInitializing = false;
 	IsPendingRedraw = false;
+	IsPendingRedrawEntire = false;
 	ExecuteRedrawMapCoroutine(true);
 }
 
@@ -900,6 +908,7 @@ void UCartographGameInstanceModule::OnCoroutineFinishedOrCancelled()
     {
         UKismetRenderingLibrary::EndDrawCanvasToRenderTarget(this, RenderContext);
 		RenderContext = {};
+		CurrentCanvas = nullptr;
     }
 
 	if (!IsPendingRedraw)
@@ -909,7 +918,7 @@ void UCartographGameInstanceModule::OnCoroutineFinishedOrCancelled()
 
 	// The coroutine is also on the game thread, so I think no data race here.
     IsPendingRedraw = false;
-	ExecuteRedrawMapCoroutine(IsPendingRedrawEntire);
+	ExecuteRedrawMapCoroutine(std::exchange(IsPendingRedrawEntire, false));
 }
 
 
@@ -1020,53 +1029,40 @@ void UCartographGameInstanceModule::LoadRuntimeConfig()
 
 	RuntimeConfig = {};
 
-	// std::getline doesn't support std::string_view :(
+	// ParseIntoArray drops empty entries, so trailing separators are fine
+	TArray<FString> Entries;
+	ConfigInstance.MainCategoryToggle.ParseIntoArray(Entries, TEXT(","));
+	for (const FString& MainCategory : Entries)
 	{
-        std::wstringstream Stream{ *ConfigInstance.MainCategoryToggle };
-        std::wstring Line;
-        while (std::getline(Stream, Line, L','))
-        {
-			if (!Line.empty())
-			{
-				RuntimeConfig.DisabledLayerMainCategory.Add(FName{ Line.data() });
-			}
-        }
-    }
-    {
-        std::wstringstream Stream{ *ConfigInstance.SubCategoryToggle };
-        std::wstring MainCategoryLine;
-        while (std::getline(Stream, MainCategoryLine, L'|'))
-        {
-			const size_t MainCategoryColonIndex = MainCategoryLine.find(':');
-            if (MainCategoryColonIndex == std::wstring::npos)
-            {
-                CARTO_LOG_ERROR("Invalid BuildingToggle: %s", *ConfigInstance.BuildingToggle);
-                break;
-            }
-            std::wstring MainCategoryName = MainCategoryLine.substr(0, MainCategoryColonIndex);
-            const FName MainCategoryFName{ MainCategoryName.data() };
-
-            std::wstringstream SubCategoryStream{ MainCategoryLine.substr(MainCategoryColonIndex + 1) };
-            std::wstring SubCategoryLine;
-			while (std::getline(SubCategoryStream, SubCategoryLine, L','))
-			{
-				if (!SubCategoryLine.empty())
-				{
-					RuntimeConfig.DisabledLayerSubCategory.FindOrAdd(MainCategoryFName).Add(FName{ SubCategoryLine.data() });
-				}
-			}
-        }
+		RuntimeConfig.DisabledLayerMainCategory.Add(FName{ MainCategory });
 	}
 
+	// "Main:Sub,Sub|Main:Sub|"
+	ConfigInstance.SubCategoryToggle.ParseIntoArray(Entries, TEXT("|"));
+	for (const FString& Entry : Entries)
 	{
-		std::wstringstream Stream{ *ConfigInstance.BuildingToggle };
-		std::wstring Line;
-		while (std::getline(Stream, Line, L','))
+		FString MainCategory, SubCategories;
+		if (!Entry.Split(TEXT(":"), &MainCategory, &SubCategories))
 		{
-			if (!Line.empty())
-			{
-				RuntimeConfig.DisabledLayerBuildable.Add(std::stoul(Line));
-			}
+			CARTO_LOG_ERROR("Invalid SubCategoryToggle: %s", *ConfigInstance.SubCategoryToggle);
+			break;
+		}
+
+		TArray<FString> SubCategoryNames;
+		SubCategories.ParseIntoArray(SubCategoryNames, TEXT(","));
+		for (const FString& SubCategory : SubCategoryNames)
+		{
+			RuntimeConfig.DisabledLayerSubCategory.FindOrAdd(FName{ MainCategory }).Add(FName{ SubCategory });
+		}
+	}
+
+	ConfigInstance.BuildingToggle.ParseIntoArray(Entries, TEXT(","));
+	for (const FString& Hash : Entries)
+	{
+		// Skip garbage instead of aborting like std::stoul would (no exceptions in UE)
+		if (Hash.IsNumeric())
+		{
+			RuntimeConfig.DisabledLayerBuildable.Add(static_cast<uint32>(FCString::Strtoui64(*Hash, nullptr, 10)));
 		}
 	}
 
@@ -1078,55 +1074,31 @@ void UCartographGameInstanceModule::LoadRuntimeConfig()
 void UCartographGameInstanceModule::SaveRuntimeConfig()
 {
 #if !UE_SERVER
-	const FConfigId ConfigId{ "Cartograph", "" };
 	const UConfigManager* ConfigManager = GetWorld()->GetGameInstance()->GetSubsystem<UConfigManager>();
-	const UConfigPropertySection* RootSection = ConfigManager->GetConfigurationRootSection(ConfigId);
+	const UConfigPropertySection* RootSection = ConfigManager->GetConfigurationRootSection(FConfigId{ "Cartograph", "" });
 
-	{
-		const TObjectPtr<UConfigProperty>* MainCategoryProperty = RootSection->SectionProperties.Find("MainCategoryToggle");
-		CARTO_LOG_ERROR_RETURN_IF_NULL(MainCategoryProperty);
-		auto* MainCategoryStringProperty = Cast<UConfigPropertyString>(*MainCategoryProperty);
-		CARTO_LOG_ERROR_RETURN_IF_NULL(MainCategoryStringProperty);
+	const auto SetStringProperty = [RootSection](const TCHAR* Name, const FString& Value)
+		{
+			const TObjectPtr<UConfigProperty>* Property = RootSection->SectionProperties.Find(Name);
+			CARTO_LOG_ERROR_RETURN_IF_NULL(Property);
+			auto* StringProperty = Cast<UConfigPropertyString>(*Property);
+			CARTO_LOG_ERROR_RETURN_IF_NULL(StringProperty);
+			StringProperty->Value = Value;
+			StringProperty->MarkDirty();
+		};
+	const auto NameToString = [](const FName& Name) { return Name.ToString(); };
 
-        TStringBuilder<500> Builder;
-        for (const FName& Name : RuntimeConfig.DisabledLayerMainCategory)
-        {
-			Builder.Appendf(TEXT("%s,"), *Name.ToString());
-        }
-        MainCategoryStringProperty->Value = Builder.ToString();
-		MainCategoryStringProperty->MarkDirty();
-	}
+	SetStringProperty(TEXT("MainCategoryToggle"), FString::JoinBy(RuntimeConfig.DisabledLayerMainCategory, TEXT(","), NameToString));
+
+	FString SubCategoryToggle;
+	for (const auto& [MainCategory, SubCategories] : RuntimeConfig.DisabledLayerSubCategory)
 	{
-		const TObjectPtr<UConfigProperty>* SubCategoryProperty = RootSection->SectionProperties.Find("SubCategoryToggle");
-        CARTO_LOG_ERROR_RETURN_IF_NULL(SubCategoryProperty);
-        auto* SubCategoryStringProperty = Cast<UConfigPropertyString>(*SubCategoryProperty);
-        CARTO_LOG_ERROR_RETURN_IF_NULL(SubCategoryStringProperty);
-        TStringBuilder<1000> Builder;
-        for (const auto& [MainCategory, SubCategories] : RuntimeConfig.DisabledLayerSubCategory)
-        {
-            Builder.Appendf(TEXT("%s:"), *MainCategory.ToString());
-            for (const FName& Name : SubCategories)
-            {
-				Builder.Appendf(TEXT("%s,"), *Name.ToString());
-            }
-            Builder.Append(TEXT("|"));
-        }
-        SubCategoryStringProperty->Value = Builder.ToString();
-        SubCategoryStringProperty->MarkDirty();
-    }
-    {
-	    const TObjectPtr<UConfigProperty>* BuildingProperty = RootSection->SectionProperties.Find("BuildingToggle");
-        CARTO_LOG_ERROR_RETURN_IF_NULL(BuildingProperty);
-        auto* BuildingStringProperty = Cast<UConfigPropertyString>(*BuildingProperty);
-        CARTO_LOG_ERROR_RETURN_IF_NULL(BuildingStringProperty);
-        TStringBuilder<11 * 551> Builder;
-        for (const uint32& Hash : RuntimeConfig.DisabledLayerBuildable)
-        {
-			Builder.Appendf(TEXT("%u,"), Hash);
-        }
-        BuildingStringProperty->Value = Builder.ToString();
-        BuildingStringProperty->MarkDirty();
+		SubCategoryToggle += MainCategory.ToString() + TEXT(":") + FString::JoinBy(SubCategories, TEXT(","), NameToString) + TEXT("|");
 	}
+	SetStringProperty(TEXT("SubCategoryToggle"), SubCategoryToggle);
+
+	SetStringProperty(TEXT("BuildingToggle"), FString::JoinBy(RuntimeConfig.DisabledLayerBuildable, TEXT(","),
+		[](uint32 Hash) { return FString::Printf(TEXT("%u"), Hash); }));
 
 	CARTO_LOG_DEBUG("RuntimeConfig Saved");
 #endif
