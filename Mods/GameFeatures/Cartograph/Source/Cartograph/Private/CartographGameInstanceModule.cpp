@@ -438,8 +438,8 @@ UE5Coro::TCoroutine<> UCartographGameInstanceModule::InitialBuildableGather(
 	const int Size = CurrentBuildingData.Num();
 	for (int i = 0; i < Size; i++)
 	{
-		const FBuildingData& BuildingData = CurrentBuildingData[i];
-		OnBuildingDataAdd(BuildingData, i);
+		OnBuildingDataAdd(CurrentBuildingData[i], i);
+		co_await Budget;
 	}
 
 	OnZFilterUpdated(0, 1);
@@ -1088,11 +1088,15 @@ void UCartographGameInstanceModule::OnBuildingDataAdd(const FBuildingData& Added
 	if (AddedBuildingData.VisualBoxCache.bIsValid)
 	{
 		CurrentBuildingQuadTree.Insert(BuildingDataIndexRedirector.Num(), AddedBuildingData.VisualBoxCache);
-		for (int32& Index : BuildingDataIndexRedirector)
+		// The initial data is added in sorted order, so there's nothing to shift
+		if (!IsInitializing)
 		{
-			if (Index >= Pos)
+			for (int32& Index : BuildingDataIndexRedirector)
 			{
-				Index++;
+				if (Index >= Pos)
+				{
+					Index++;
+				}
 			}
 		}
 		BuildingDataIndexRedirector.Add(Pos);
