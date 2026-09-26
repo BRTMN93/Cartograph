@@ -185,6 +185,7 @@ public:
 	virtual void DispatchLifecycleEvent(ELifecyclePhase Phase) override;
 
 	void OnWorldLoaded(UWorld* World);
+	void OnWorldTearDown(UWorld* World);
 
 	void OnLayerConfigChanged();
 

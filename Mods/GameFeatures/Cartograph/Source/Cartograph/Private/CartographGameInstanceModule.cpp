@@ -110,6 +110,8 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 
 	LoadRuntimeConfig();
 
+	FWorldDelegates::OnWorldBeginTearDown.AddUObject(this, &UCartographGameInstanceModule::OnWorldTearDown);
+
 
 #pragma region Hooking
 	const auto ShouldSkipChange = [this] { return ShouldInitialize || IsClient || !GIsRunning; };
@@ -318,6 +320,27 @@ void UCartographGameInstanceModule::OnWorldLoaded(UWorld* World)
 	{
 		UKismetRenderingLibrary::ClearRenderTarget2D(this, RenderTarget, { 0, 0, 0, 0 });
 	}
+}
+
+
+// Nothing may carry over to the next world: a redraw still going on would work on the data gathered there
+void UCartographGameInstanceModule::OnWorldTearDown(UWorld* World)
+{
+	if (World != GetWorld())
+	{
+		return;
+	}
+
+	CARTO_LOG("OnWorldTearDown");
+
+	ShouldInitialize = true;  // Also ignores the buildings removed while tearing down
+	IsPendingRedraw = false;
+	IsPendingRedrawEntire = false;
+	PendingAddBuildingData.Empty();
+	PendingRemoveBuildingData.Empty();
+	IsRedrawingEntirely = false;
+	RedrawArea = FBox2D{ ForceInit };
+	Coroutine.Cancel();
 }
 
 
