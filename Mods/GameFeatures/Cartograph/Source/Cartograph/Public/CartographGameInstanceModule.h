@@ -211,6 +211,12 @@ private:
 	void UpdateZFilter();
 	void ResetBuildingData();
 
+	void SaveMapCache();
+	bool LoadMapCache();
+	FString GetMapCachePath() const;
+	uint64 HashBuildingData() const;
+	uint32 HashDrawSettings() const;
+
 	void RegisterMenuButton() const;
 
 	void LoadRuntimeConfig();
@@ -379,6 +385,9 @@ protected:
 	bool IsRedrawingEntirely = false;
 	FBox2D RedrawArea;
 	std::array<uint32, 4> ScissorArea;
+
+	// Whether the map changed since its image was last saved or loaded
+	bool IsMapCacheOutdated = true;
 
     bool IsClient = false;
 

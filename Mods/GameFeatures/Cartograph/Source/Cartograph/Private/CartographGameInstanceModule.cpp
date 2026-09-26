@@ -12,6 +12,15 @@
 #include "Components/HorizontalBoxSlot.h"
 #include "Misc/OutputDeviceNull.h"
 #include "Blueprint/WidgetBlueprintGeneratedClass.h"
+#include "Compression/OodleDataCompressionUtil.h"
+#include "HAL/FileManager.h"
+#include "Hash/CityHash.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "RenderingThread.h"
+#include "RHICommandList.h"
+#include "Tasks/Task.h"
+#include "TextureResource.h"
 
 #include "FGLightweightBuildableSubsystem.h"
 #include "Buildables/FGBuildable.h"
@@ -239,6 +248,13 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 		SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGBuildableSubsystem, RemoveBuildable, LambdaAfterRemoveBuildable);
 
 
+		SUBSCRIBE_UOBJECT_METHOD_AFTER(UFGSaveSession, SaveGame,
+			[this](UFGSaveSession* ClassInstance, const FString& FileName, FOnSaveGameComplete CompleteDelegate, void* UserData)
+			{
+				SaveMapCache();
+			});
+
+
 		SUBSCRIBE_METHOD(FCanvas::GetBatchedElements,
 			[](auto& Scope, FCanvas* ClassInstance,
 				FCanvas::EElementType InElementType, FBatchedElementParameters* InBatchedElementParameters, const FTexture* InTexture, ESimpleElementBlendMode InBlendMode, const FDepthFieldGlowInfo& GlowInfo, bool bApplyDPIScale)
@@ -381,6 +397,8 @@ TSubclassOf<AFGBuildable> UCartographGameInstanceModule::ResolveBuildableClass(U
 #pragma region Drawing
 void UCartographGameInstanceModule::RedrawMap(bool bRedrawEntirely)
 {
+	IsMapCacheOutdated = true;
+
 	if (!Coroutine.IsDone())
 	{
 		// An entire redraw isn't restarted for a building change, the change gets drawn right after it instead.
@@ -469,7 +487,11 @@ UE5Coro::TCoroutine<> UCartographGameInstanceModule::InitialBuildableGather(
 
 	OnZFilterUpdated(0, 1);
 
-	CARTO_LOG("InitialBuildableGather Finished");
+	// With an image saved for this same map there's nothing to draw
+	const bool bMapCacheUsed = LoadMapCache();
+	IsMapCacheOutdated = !bMapCacheUsed;
+
+	CARTO_LOG("InitialBuildableGather Finished. Map cache used: %d", bMapCacheUsed);
 
 	for (const auto& [ClassHash, Count] : BuildingCountMap)
 	{
@@ -478,8 +500,11 @@ UE5Coro::TCoroutine<> UCartographGameInstanceModule::InitialBuildableGather(
 
 	IsInitializing = false;
 	IsPendingRedraw = false;
-	IsPendingRedrawEntire = false;
-	ExecuteRedrawMapCoroutine(true);
+	const bool bRedrawEntirely = std::exchange(IsPendingRedrawEntire, false) || !bMapCacheUsed;
+	if (bRedrawEntirely || !PendingAddBuildingData.IsEmpty() || !PendingRemoveBuildingData.IsEmpty())
+	{
+		ExecuteRedrawMapCoroutine(bRedrawEntirely);
+	}
 }
 
 
@@ -902,6 +927,169 @@ void UCartographGameInstanceModule::ResetBuildingData()
 	BuildingDataIndexRedirector.Empty();
 	CurrentBuildingQuadTree.Empty();
 	BuildingCountMap.Empty();
+}
+#pragma endregion
+
+
+#pragma region Map Cache
+constexpr int32 MAP_CACHE_COUNT = 10;
+
+
+static FString GetMapCacheDir()
+{
+	return FPaths::ProjectSavedDir() / TEXT("Cartograph");
+}
+
+
+// Named after what is drawn and how, so an image only ever gets loaded for the same map
+FString UCartographGameInstanceModule::GetMapCachePath() const
+{
+	return GetMapCacheDir() / FString::Printf(TEXT("%016llx.mapcache"), HashBuildingData() + HashDrawSettings());
+}
+
+
+// Called on every save, so loading that save can show the map right away instead of drawing it again.
+void UCartographGameInstanceModule::SaveMapCache()
+{
+	if (IsClient || FPlatformProperties::IsServerOnly() || RenderTarget->GetFormat() != PF_B8G8R8A8)
+	{
+		return;
+	}
+
+	if (!IsMapCacheOutdated)
+	{
+		CARTO_LOG("Map cache is up to date");
+		return;
+	}
+
+	// The image has to show exactly CurrentBuildingData, and unfiltered since the Z filter is reset on load
+	if (ShouldInitialize || IsInitializing || !Coroutine.IsDone() || !PendingAddBuildingData.IsEmpty() || !PendingRemoveBuildingData.IsEmpty()
+		|| MinCached != 0 || MaxCached != 1)
+	{
+		CARTO_LOG("Map cache not saved, the map is being updated or filtered");
+		return;
+	}
+
+	// This waits for the GPU, but saving the game hitches anyway
+	TArray<FColor> Pixels;
+	if (!RenderTarget->GameThread_GetRenderTargetResource()->ReadPixels(Pixels))
+	{
+		CARTO_LOG_ERROR("Failed to read the map");
+		return;
+	}
+	IsMapCacheOutdated = false;
+
+	UE::Tasks::Launch(UE_SOURCE_LOCATION, [Path = GetMapCachePath(), Pixels = MoveTemp(Pixels)]
+		{
+			// A file cut short by a crash fails to decompress, which only costs one full redraw
+			TArray<uint8> File;
+			if (!FOodleCompressedArray::CompressTArray(File, Pixels, FOodleDataCompression::ECompressor::Kraken, FOodleDataCompression::ECompressionLevel::Fast)
+				|| !FFileHelper::SaveArrayToFile(File, *Path))
+			{
+				CARTO_LOG_ERROR("Failed to save the map cache: %s", *Path);
+				return;
+			}
+			CARTO_LOG("Map cache saved: %s (%d KB)", *Path, File.Num() / 1024);
+
+			// Only the newest ones are kept
+			IFileManager& FileManager = IFileManager::Get();
+			TArray<FString> Files;
+			FileManager.FindFiles(Files, *(GetMapCacheDir() / TEXT("*.mapcache")), true, false);
+			Algo::SortBy(Files, [&FileManager](const FString& Name) { return FileManager.GetTimeStamp(*(GetMapCacheDir() / Name)); }, TGreater<>());
+			for (int32 i = MAP_CACHE_COUNT; i < Files.Num(); i++)
+			{
+				FileManager.Delete(*(GetMapCacheDir() / Files[i]));
+			}
+		});
+}
+
+
+// Puts the image saved for this same map on it, if there is one
+bool UCartographGameInstanceModule::LoadMapCache()
+{
+	if (FPlatformProperties::IsServerOnly() || RenderTarget->GetFormat() != PF_B8G8R8A8)
+	{
+		return false;
+	}
+
+	const FString Path = GetMapCachePath();
+	TArray<uint8> File;
+	TArray<FColor> Pixels;
+	if (!FFileHelper::LoadFileToArray(File, *Path, FILEREAD_Silent)
+		|| !FOodleCompressedArray::DecompressToTArray(Pixels, File) || Pixels.Num() != RENDER_TEXTURE_SIZE * RENDER_TEXTURE_SIZE)
+	{
+		CARTO_LOG("No map cache found");
+		return false;
+	}
+	IFileManager::Get().SetTimeStamp(*Path, FDateTime::UtcNow());  // Keeps it among the newest
+
+	FTextureRenderTargetResource* Resource = RenderTarget->GameThread_GetRenderTargetResource();
+	ENQUEUE_RENDER_COMMAND(CartographLoadMapCache)(
+		[Resource, Pixels = MoveTemp(Pixels)](FRHICommandListImmediate& RHICmdList)
+		{
+			RHICmdList.UpdateTexture2D(Resource->GetRenderTargetTexture(), 0,
+				FUpdateTextureRegion2D{ 0, 0, 0, 0, RENDER_TEXTURE_SIZE, RENDER_TEXTURE_SIZE },
+				RENDER_TEXTURE_SIZE * static_cast<uint32>(sizeof(FColor)), reinterpret_cast<const uint8*>(Pixels.GetData()));
+		});
+	RenderTarget->UpdateResourceImmediate(false);  // Regenerates the mips
+
+	CARTO_LOG("Map cache loaded: %s", *Path);
+	return true;
+}
+
+
+// Of the drawn buildings. Only the transforms, rounded: loading the game recalculates some of them
+// (and things like spline points) with tiny differences.
+uint64 UCartographGameInstanceModule::HashBuildingData() const
+{
+	uint64 Hash = 0;
+	for (const FBuildingData& BuildingData : CurrentBuildingData)
+	{
+		if (!BuildingData.VisualBoxCache.bIsValid)
+		{
+			continue;  // Not drawn
+		}
+
+		const FVector Location = BuildingData.Transform.GetLocation();
+		const FQuat Rotation = BuildingData.Transform.GetRotation();
+		const int32 Values[] = {
+			FMath::RoundToInt32(Location.X), FMath::RoundToInt32(Location.Y), FMath::RoundToInt32(Location.Z),
+			FMath::RoundToInt32(Rotation.X * 10000), FMath::RoundToInt32(Rotation.Y * 10000),
+			FMath::RoundToInt32(Rotation.Z * 10000), FMath::RoundToInt32(Rotation.W * 10000),
+		};
+		// A sum, so the order doesn't matter
+		Hash += CityHash64WithSeed(reinterpret_cast<const char*>(Values), sizeof(Values), BuildingData.BuildableClassHash);
+	}
+	return Hash;
+}
+
+
+// Everything besides the buildings that changes the image. Summed since sets have no fixed order,
+// and names are hashed as text since FName hashes differ between runs.
+uint32 UCartographGameInstanceModule::HashDrawSettings() const
+{
+	uint32 Hash = 0;
+	for (const FName& MainCategory : RuntimeConfig.DisabledLayerMainCategory)
+	{
+		Hash += FCrc::StrCrc32(*MainCategory.ToString());
+	}
+	for (const auto& [MainCategory, SubCategories] : RuntimeConfig.DisabledLayerSubCategory)
+	{
+		for (const FName& SubCategory : SubCategories)
+		{
+			Hash += FCrc::StrCrc32(*(MainCategory.ToString() + TEXT(":") + SubCategory.ToString()));
+		}
+	}
+	for (const uint32 ClassHash : RuntimeConfig.DisabledLayerBuildable)
+	{
+		Hash += ClassHash;
+	}
+	// Mods can change the colors, or be Cartograph itself
+	for (const FModInfo& Mod : GetWorld()->GetGameInstance()->GetSubsystem<UModLoadingLibrary>()->GetLoadedMods())
+	{
+		Hash += FCrc::StrCrc32(*(Mod.Name + TEXT("@") + Mod.Version.ToString()));
+	}
+	return Hash;
 }
 #pragma endregion
 
