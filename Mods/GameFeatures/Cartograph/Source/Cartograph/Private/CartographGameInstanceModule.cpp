@@ -15,9 +15,12 @@
 #include "Compression/OodleDataCompressionUtil.h"
 #include "GlobalRenderResources.h"
 #include "HAL/FileManager.h"
+#include "HAL/IConsoleManager.h"
 #include "Hash/CityHash.h"
+#include "ImageUtils.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Modules/ModuleManager.h"
 #include "RenderingThread.h"
 #include "RHICommandList.h"
 #include "RHIUtilities.h"
@@ -1093,6 +1096,60 @@ bool UCartographGameInstanceModule::LoadMapCache()
 
 	CARTO_LOG("Map cache loaded: %s", *Path);
 	return true;
+}
+
+
+static FAutoConsoleCommandWithWorldArgsAndOutputDevice ExportMapCommand(
+	TEXT("Cartograph.ExportMap"),
+	TEXT("Saves the Cartograph map as a PNG in the screenshots folder"),
+	FConsoleCommandWithWorldArgsAndOutputDeviceDelegate::CreateLambda([](const TArray<FString>&, UWorld*, FOutputDevice& Ar)
+		{
+			if (UCartographGameInstanceModule::Instance)
+			{
+				UCartographGameInstanceModule::Instance->ExportMap(Ar);
+			}
+		}));
+
+
+// Only the buildings, on a transparent background. The terrain under them is the game's own map.
+void UCartographGameInstanceModule::ExportMap(FOutputDevice& Ar)
+{
+	if (FPlatformProperties::IsServerOnly() || !RenderTarget)
+	{
+		Ar.Log(TEXT("There's no map to export here"));
+		return;
+	}
+	if (!Coroutine.IsDone())
+	{
+		Ar.Log(TEXT("The map is still being drawn, try again when it's done"));
+		return;
+	}
+
+	TArray<FColor> Pixels;
+	if (!RenderTarget->GameThread_GetRenderTargetResource()->ReadPixels(Pixels))
+	{
+		Ar.Log(TEXT("Couldn't read the map"));
+		return;
+	}
+
+	const FString Path = FPaths::ConvertRelativePathToFull(FPaths::ScreenShotDir()
+		/ FString::Printf(TEXT("Cartograph %s.png"), *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H-%M-%S"))));
+	Ar.Logf(TEXT("Saving the map to %s"), *Path);
+
+	// Compressing an 8K PNG takes seconds, so not on the game thread.
+	// What does it is loaded here though, modules are only to be loaded on the game thread.
+	FModuleManager::Get().LoadModule(TEXT("ImageWrapper"));
+	UE::Tasks::Launch(UE_SOURCE_LOCATION, [Path, Width = RenderTarget->SizeX, Height = RenderTarget->SizeY, Pixels = MoveTemp(Pixels)]
+		{
+			TArray64<uint8> Png;
+			FImageUtils::PNGCompressImageArray(Width, Height, TArrayView64<const FColor>{ Pixels.GetData(), Pixels.Num() }, Png);
+			if (Png.IsEmpty() || !FFileHelper::SaveArrayToFile(Png, *Path))
+			{
+				CARTO_LOG_ERROR("Failed to save the map: %s", *Path);
+				return;
+			}
+			CARTO_LOG("Map saved: %s (%lld MB)", *Path, Png.Num() / (1024 * 1024));
+		});
 }
 
 
