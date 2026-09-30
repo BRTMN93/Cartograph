@@ -105,6 +105,156 @@ void draw_line(FBatchedElements& Batch, const T& WorldStart, const U& WorldEnd, 
 }
 
 
+static bool is_layer_shown(const FRuntimeConfig& Config, const FBuildingData& BuildingData)
+{
+	if (Config.DisabledLayerBuildable.Contains(BuildingData.BuildableClassHash))
+	{
+		return false;
+	}
+	if (const FBuildLayerData* LayerData = BuildingData.LayerDataCache)
+	{
+		if (Config.DisabledLayerMainCategory.Contains(LayerData->MainCategoryCache))
+		{
+			return false;
+		}
+		if (const TSet<FName>* SubCategories = Config.DisabledLayerSubCategory.Find(LayerData->MainCategoryCache))
+		{
+			return !SubCategories->Contains(LayerData->SubCategoryCache);
+		}
+	}
+	return true;
+}
+
+
+static const TSoftObjectPtr<UTexture2D>* get_icon(const FBuildingData& BuildingData)
+{
+	const FNormalDataCache* NormalDataCache = BuildingData.DataType == EBuildingDataType::Icon ? std::get_if<FNormalDataCache>(&BuildingData.DataCache) : nullptr;
+	return NormalDataCache ? std::get_if<TSoftObjectPtr<UTexture2D>>(&NormalDataCache->IconOrRectangleData) : nullptr;
+}
+
+
+// The canvas flushes after every DrawItem, so drawing item by item sent every tile and line to the GPU on its own,
+// which took about a minute for the entire map on a big save. Tiles and lines are all triangles here, blended the same,
+// so what's drawn between two flushes goes out in one pass. Only a texture change starts a new batch, that keeps the order by height.
+static void draw_building(FCanvas& Canvas, const FBuildingData& BuildingData, const UTexture2D* Icon)
+{
+	const auto GetBatch = [&Canvas](const FTexture* Texture) -> FBatchedElements&
+		{
+			return *Canvas.GetBatchedElements(FCanvas::ET_Triangle, nullptr, Texture, SE_BLEND_AlphaBlend);
+		};
+
+	const auto& [ClassHash, Transform, BuildableExtraData, DataType, DataCache, LayerDataCache, VisualBoxCache] = BuildingData;
+
+	switch (DataType)
+	{
+	case EBuildingDataType::Invalid:
+		break;
+
+	case EBuildingDataType::Icon:
+	{
+		const FNormalDataCache* NormalDataCachePtr = std::get_if<FNormalDataCache>(&DataCache);
+		CARTO_LOG_ERROR_BREAK_IF_NULL(NormalDataCachePtr);
+		CARTO_LOG_ERROR_BREAK_IF_NULL(Icon);
+		const FTexture* Resource = Icon->GetResource();
+		CARTO_LOG_ERROR_BREAK_IF_NULL(Resource);
+
+		const auto& [ScreenPosition, Size, Rotation, IconOrRectangleData] = *NormalDataCachePtr;
+		draw_tile(GetBatch(Resource), Resource, ScreenPosition, { Size.X * PIXEL_PER_CENTIMETER[0], Size.Y * PIXEL_PER_CENTIMETER[1] }, Rotation, FLinearColor::White);
+		break;
+	}
+
+	case EBuildingDataType::Rectangle:
+	{
+		const FNormalDataCache* NormalDataCachePtr = std::get_if<FNormalDataCache>(&DataCache);
+		CARTO_LOG_ERROR_BREAK_IF_NULL(NormalDataCachePtr);
+
+		const auto& [ScreenPosition, Size, Rotation, IconOrRectangleData] = *NormalDataCachePtr;
+		const FRectangleDataCache* RectangleDataCachePtr = std::get_if<FRectangleDataCache>(&IconOrRectangleData);
+		CARTO_LOG_ERROR_BREAK_IF_NULL(RectangleDataCachePtr);
+
+		const auto& [CategoryData, Corners] = *RectangleDataCachePtr;
+		CARTO_LOG_ERROR_BREAK_IF_NULL(CategoryData);
+
+		FBatchedElements& Batch = GetBatch(GWhiteTexture);
+		draw_tile(Batch, GWhiteTexture, ScreenPosition, { Size.X * PIXEL_PER_CENTIMETER[0], Size.Y * PIXEL_PER_CENTIMETER[1] }, Rotation, CategoryData->MainColor);
+
+		if (CategoryData->OutlineThickness > 0)
+		{
+			for (int32 k = 0; k < 4; k++)
+			{
+				draw_line(Batch, Corners[k], Corners[(k + 1) % 4], CategoryData->OutlineColor, CategoryData->OutlineThickness);
+			}
+		}
+		break;
+	}
+
+	case EBuildingDataType::Spline:
+	{
+		const FSplineDataCache* SplineDataCachePtr = std::get_if<FSplineDataCache>(&DataCache);
+		CARTO_LOG_ERROR_BREAK_IF_NULL(SplineDataCachePtr);
+
+		const FSplineExtraData* SplineExtraData = std::get_if<FSplineExtraData>(&BuildableExtraData);
+		CARTO_LOG_ERROR_BREAK_IF_NULL(SplineExtraData);
+
+		FBatchedElements& Batch = GetBatch(GWhiteTexture);
+		const int Num = SplineExtraData->Points.Num();
+		for (int j = 0; j < Num - 1; j++)
+		{
+			draw_line(Batch, SplineExtraData->Points[j], SplineExtraData->Points[j + 1],
+				SplineDataCachePtr->SplineData->Color, SplineDataCachePtr->SplineData->Thickness);
+		}
+		break;
+	}
+
+	case EBuildingDataType::Wire:
+	{
+		const FWireExtraData* WireExtraData = std::get_if<FWireExtraData>(&BuildableExtraData);
+		CARTO_LOG_ERROR_BREAK_IF_NULL(WireExtraData);
+
+		const FWireData* const* WireDataPtr = std::get_if<const FWireData*>(&DataCache);
+		CARTO_LOG_ERROR_BREAK_IF_NULL(WireDataPtr);
+		const FWireData* WireData = *WireDataPtr;
+
+		draw_line(GetBatch(GWhiteTexture), Transform.GetLocation(), WireExtraData->End, WireData->Color, WireData->Thickness);
+		break;
+	}
+
+	case EBuildingDataType::Beam:
+	{
+		const FBeamExtraData* BeamExtraData = std::get_if<FBeamExtraData>(&BuildableExtraData);
+		CARTO_LOG_ERROR_BREAK_IF_NULL(BeamExtraData);
+
+		const FWireData* const* BeamDataPtr = std::get_if<const FWireData*>(&DataCache);
+		CARTO_LOG_ERROR_BREAK_IF_NULL(BeamDataPtr);
+		const FWireData* BeamData = *BeamDataPtr;
+
+		const float Length = BeamExtraData->Length;
+		const FVector Start = Transform.GetLocation();
+		const FVector End = Start + Transform.GetRotation().Vector() * Length;
+		draw_line(GetBatch(GWhiteTexture), Start, End, BeamData->Color, BeamData->Thickness);
+		break;
+	}
+
+	default:
+		break;
+	}
+
+	if constexpr (DRAW_BOUNDARIES)
+	{
+		constexpr FLinearColor Color{ 1, 0, 1, 1 };
+		constexpr float Thickness = 2;
+
+		const FVector2D MinPoint = VisualBoxCache.Min;
+		const FVector2D MaxPoint = VisualBoxCache.Max;
+		FBatchedElements& Batch = GetBatch(GWhiteTexture);
+		draw_line(Batch, FVector2D{ MinPoint.X, MinPoint.Y }, FVector2D{ MaxPoint.X, MinPoint.Y }, Color, Thickness);
+		draw_line(Batch, FVector2D{ MaxPoint.X, MinPoint.Y }, FVector2D{ MaxPoint.X, MaxPoint.Y }, Color, Thickness);
+		draw_line(Batch, FVector2D{ MaxPoint.X, MaxPoint.Y }, FVector2D{ MinPoint.X, MaxPoint.Y }, Color, Thickness);
+		draw_line(Batch, FVector2D{ MinPoint.X, MaxPoint.Y }, FVector2D{ MinPoint.X, MinPoint.Y }, Color, Thickness);
+	}
+}
+
+
 void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase)
 {
 	Super::DispatchLifecycleEvent(Phase);
@@ -726,163 +876,30 @@ UE5Coro::TCoroutine<> UCartographGameInstanceModule::RedrawMapCoroutine(
 		CARTO_LOG_DEBUG("Overlapping Elements: %d", BuildingsToDraw.Num());
 	}
 
-	// The canvas flushes after every DrawItem, so drawing item by item sent every tile and line to the GPU on its own,
-	// which took about a minute for the entire map on a big save. Tiles and lines are all triangles here, blended the same,
-	// so what a tick draws goes out in one pass. Only a texture change starts a new batch, that keeps the order by height.
-	const auto GetBatch = [this](const FTexture* Texture) -> FBatchedElements&
-		{
-			return *CurrentCanvas->GetBatchedElements(FCanvas::ET_Triangle, nullptr, Texture, SE_BLEND_AlphaBlend);
-		};
-
 	for (int32 i : BuildingsToDraw)
 	{
-        const auto& [ClassHash, Transform, BuildableExtraData,
-			DataType, DataCache, LayerDataCache, VisualBoxCache] = CurrentBuildingData[i];
+		const FBuildingData& BuildingData = CurrentBuildingData[i];
 
-		CARTO_LOG_VERY_VERBOSE("%d | Buildable: %u, Transform: %s", i, ClassHash, *Transform.ToString());
+		CARTO_LOG_VERY_VERBOSE("%d | Buildable: %u, Transform: %s", i, BuildingData.BuildableClassHash, *BuildingData.Transform.ToString());
 
-		if (RuntimeConfig.DisabledLayerBuildable.Contains(ClassHash))
+		if (!is_layer_shown(RuntimeConfig, BuildingData))
 		{
-            continue;
-		}
-		if (LayerDataCache)
-		{
-			if (RuntimeConfig.DisabledLayerMainCategory.Contains(LayerDataCache->MainCategoryCache))
-			{
-				continue;
-			}
-			if (const TSet<FName>* SubCategories = RuntimeConfig.DisabledLayerSubCategory.Find(LayerDataCache->MainCategoryCache))
-			{
-				if (SubCategories->Contains(LayerDataCache->SubCategoryCache))
-				{
-					continue;
-				}
-			}
+			continue;
 		}
 
-		switch (DataType)
+		// The texture might have gotten unloaded between redraws, so we can't cache it.
+		const UTexture2D* Icon = nullptr;
+		if (const TSoftObjectPtr<UTexture2D>* IconPath = get_icon(BuildingData))
 		{
-		case EBuildingDataType::Invalid:
-			break;
-
-		case EBuildingDataType::Icon:
-		{
-			const FNormalDataCache* NormalDataCachePtr = std::get_if<FNormalDataCache>(&DataCache);
-			CARTO_LOG_ERROR_BREAK_IF_NULL(NormalDataCachePtr);
-
-			const auto& [ScreenPosition, Size, Rotation, IconOrRectangleData] = *NormalDataCachePtr;
-            const TSoftObjectPtr<UTexture2D>* Texture = std::get_if<TSoftObjectPtr<UTexture2D>>(&IconOrRectangleData);
-            CARTO_LOG_ERROR_BREAK_IF_NULL(Texture);
-
-			// The texture might have gotten unloaded between redraws, so we can't cache it.
-			const UTexture2D* LoadedTexture = Texture->Get();
-			if (!LoadedTexture)
+			Icon = IconPath->Get();
+			if (!Icon)
 			{
 				CurrentCanvas->Flush_GameThread();  // What's batched can't wait for the load, its textures aren't kept loaded
-				LoadedTexture = co_await UE5Coro::Latent::AsyncLoadObject(*Texture);
+				Icon = co_await UE5Coro::Latent::AsyncLoadObject(*IconPath);
 			}
-			CARTO_LOG_ERROR_BREAK_IF_NULL(LoadedTexture);
-			const FTexture* Resource = LoadedTexture->GetResource();
-			CARTO_LOG_ERROR_BREAK_IF_NULL(Resource);
-
-			draw_tile(GetBatch(Resource), Resource, ScreenPosition, { Size.X * PIXEL_PER_CENTIMETER[0], Size.Y * PIXEL_PER_CENTIMETER[1] }, Rotation, FLinearColor::White);
-
-			break;
 		}
 
-		case EBuildingDataType::Rectangle:
-		{
-			const FNormalDataCache* NormalDataCachePtr = std::get_if<FNormalDataCache>(&DataCache);
-            CARTO_LOG_ERROR_BREAK_IF_NULL(NormalDataCachePtr);
-
-			const auto& [ScreenPosition, Size, Rotation, IconOrRectangleData] = *NormalDataCachePtr;
-			const FRectangleDataCache* RectangleDataCachePtr = std::get_if<FRectangleDataCache>(&IconOrRectangleData);
-			CARTO_LOG_ERROR_BREAK_IF_NULL(RectangleDataCachePtr);
-
-			const auto& [CategoryData, Corners] = *RectangleDataCachePtr;
-			CARTO_LOG_ERROR_BREAK_IF_NULL(CategoryData);
-
-			FBatchedElements& Batch = GetBatch(GWhiteTexture);
-			draw_tile(Batch, GWhiteTexture, ScreenPosition, { Size.X * PIXEL_PER_CENTIMETER[0], Size.Y * PIXEL_PER_CENTIMETER[1] }, Rotation, CategoryData->MainColor);
-
-			if (CategoryData->OutlineThickness > 0)
-			{
-				for (int32 k = 0; k < 4; k++)
-				{
-					draw_line(Batch, Corners[k], Corners[(k + 1) % 4], CategoryData->OutlineColor, CategoryData->OutlineThickness);
-				}
-			}
-
-			break;
-		}
-
-		case EBuildingDataType::Spline:
-		{
-            const FSplineDataCache* SplineDataCachePtr = std::get_if<FSplineDataCache>(&DataCache);
-            CARTO_LOG_ERROR_BREAK_IF_NULL(SplineDataCachePtr);
-
-			const FSplineExtraData* SplineExtraData = std::get_if<FSplineExtraData>(&BuildableExtraData);
-            CARTO_LOG_ERROR_BREAK_IF_NULL(SplineExtraData);
-
-            FBatchedElements& Batch = GetBatch(GWhiteTexture);
-            const int Num = SplineExtraData->Points.Num();
-            for (int j = 0; j < Num - 1; j++)
-            {
-                draw_line(Batch, SplineExtraData->Points[j], SplineExtraData->Points[j + 1],
-					SplineDataCachePtr->SplineData->Color, SplineDataCachePtr->SplineData->Thickness);
-            }
-
-			break;
-		}
-
-		case EBuildingDataType::Wire:
-		{
-			const FWireExtraData* WireExtraData = std::get_if<FWireExtraData>(&BuildableExtraData);
-			CARTO_LOG_ERROR_BREAK_IF_NULL(WireExtraData);
-
-			const FWireData* const* WireDataPtr = std::get_if<const FWireData*>(&DataCache);
-			CARTO_LOG_ERROR_BREAK_IF_NULL(WireDataPtr);
-            const FWireData* WireData = *WireDataPtr;
-
-			draw_line(GetBatch(GWhiteTexture), Transform.GetLocation(), WireExtraData->End, WireData->Color, WireData->Thickness);
-
-			break;
-		}
-
-        case EBuildingDataType::Beam:
-		{
-			const FBeamExtraData* BeamExtraData = std::get_if<FBeamExtraData>(&BuildableExtraData);
-			CARTO_LOG_ERROR_BREAK_IF_NULL(BeamExtraData);
-
-			const FWireData* const* BeamDataPtr = std::get_if<const FWireData*>(&DataCache);
-            CARTO_LOG_ERROR_BREAK_IF_NULL(BeamDataPtr);
-            const FWireData* BeamData = *BeamDataPtr;
-
-			const float Length = BeamExtraData->Length;
-			const FVector Start = Transform.GetLocation();
-			const FVector End = Start + Transform.GetRotation().Vector() * Length;
-			draw_line(GetBatch(GWhiteTexture), Start, End, BeamData->Color, BeamData->Thickness);
-
-            break;
-		}
-
-		default:
-			break;
-		}
-
-		if constexpr (DRAW_BOUNDARIES)
-		{
-            constexpr FLinearColor Color{ 1, 0, 1, 1 };
-            constexpr float Thickness = 2;
-
-			const FVector2D MinPoint = VisualBoxCache.Min;
-            const FVector2D MaxPoint = VisualBoxCache.Max;
-			FBatchedElements& Batch = GetBatch(GWhiteTexture);
-            draw_line(Batch, FVector2D{ MinPoint.X, MinPoint.Y }, FVector2D{ MaxPoint.X, MinPoint.Y }, Color, Thickness);
-			draw_line(Batch, FVector2D{ MaxPoint.X, MinPoint.Y }, FVector2D{ MaxPoint.X, MaxPoint.Y }, Color, Thickness);
-			draw_line(Batch, FVector2D{ MaxPoint.X, MaxPoint.Y }, FVector2D{ MinPoint.X, MaxPoint.Y }, Color, Thickness);
-			draw_line(Batch, FVector2D{ MinPoint.X, MaxPoint.Y }, FVector2D{ MinPoint.X, MinPoint.Y }, Color, Thickness);
-		}
+		draw_building(*CurrentCanvas, BuildingData, Icon);
 
 		if (!Budget.await_ready())
 		{
@@ -1101,7 +1118,7 @@ bool UCartographGameInstanceModule::LoadMapCache()
 
 static FAutoConsoleCommandWithWorldArgsAndOutputDevice ExportMapCommand(
 	TEXT("Cartograph.ExportMap"),
-	TEXT("Saves the Cartograph map as a PNG in the screenshots folder"),
+	TEXT("Saves the Cartograph map as a 16K PNG in the screenshots folder"),
 	FConsoleCommandWithWorldArgsAndOutputDeviceDelegate::CreateLambda([](const TArray<FString>&, UWorld*, FOutputDevice& Ar)
 		{
 			if (UCartographGameInstanceModule::Instance)
@@ -1111,7 +1128,8 @@ static FAutoConsoleCommandWithWorldArgsAndOutputDevice ExportMapCommand(
 		}));
 
 
-// Only the buildings, on a transparent background. The terrain under them is the game's own map.
+// The map is drawn again at twice the size it has in the game, a quarter at a time: an image viewer zooms in
+// further than the map does. Only the buildings, on a transparent background, the terrain under them is the game's own map.
 void UCartographGameInstanceModule::ExportMap(FOutputDevice& Ar)
 {
 	if (FPlatformProperties::IsServerOnly() || !RenderTarget)
@@ -1119,30 +1137,88 @@ void UCartographGameInstanceModule::ExportMap(FOutputDevice& Ar)
 		Ar.Log(TEXT("There's no map to export here"));
 		return;
 	}
-	if (!Coroutine.IsDone())
+	if (ShouldInitialize || IsInitializing)
 	{
-		Ar.Log(TEXT("The map is still being drawn, try again when it's done"));
+		Ar.Log(TEXT("The map isn't ready yet, try again in a moment"));
 		return;
 	}
 
-	TArray<FColor> Pixels;
-	if (!RenderTarget->GameThread_GetRenderTargetResource()->ReadPixels(Pixels))
+	constexpr int32 Scale = 2;
+	constexpr int32 QuarterSize = RENDER_TEXTURE_SIZE / Scale;  // On the map in the game
+	constexpr int32 ImageSize = RENDER_TEXTURE_SIZE * Scale;
+
+	// Set up like the map's own, so the colors come out the same
+	UTextureRenderTarget2D* Target = NewObject<UTextureRenderTarget2D>(this);
+	Target->RenderTargetFormat = RenderTarget->RenderTargetFormat;
+	Target->bForceLinearGamma = RenderTarget->bForceLinearGamma;
+	Target->TargetGamma = RenderTarget->TargetGamma;
+	Target->ClearColor = FLinearColor::Transparent;
+	Target->InitAutoFormat(RENDER_TEXTURE_SIZE, RENDER_TEXTURE_SIZE);
+	Target->UpdateResourceImmediate(true);
+	ON_SCOPE_EXIT
 	{
-		Ar.Log(TEXT("Couldn't read the map"));
-		return;
+		Target->ReleaseResource();
+	};
+	FTextureRenderTargetResource* Resource = Target->GameThread_GetRenderTargetResource();
+
+	const int32 Min = Algo::LowerBound(CurrentBuildingData, MinZFilter);
+	const int32 Max = Algo::UpperBound(CurrentBuildingData, MaxZFilter);
+
+	TArray64<FColor> Image;
+	Image.SetNumUninitialized(int64{ ImageSize } * ImageSize);
+	for (int32 QuarterY = 0; QuarterY < Scale; QuarterY++)
+	{
+		for (int32 QuarterX = 0; QuarterX < Scale; QuarterX++)
+		{
+			const FVector2D Offset{ double(QuarterX * QuarterSize), double(QuarterY * QuarterSize) };
+			const FBox2D Area{ screen_position_to_world_position(Offset), screen_position_to_world_position(Offset + FVector2D{ double(QuarterSize) }) };
+
+			FCanvas Canvas{ Resource, nullptr, GetWorld(), GetWorld()->GetFeatureLevel(), FCanvas::CDM_ImmediateDrawing };
+			Canvas.Clear(FLinearColor::Transparent);
+			Canvas.PushAbsoluteTransform(FTranslationMatrix{ FVector{ -Offset, 0 } } * FScaleMatrix{ double(Scale) });
+			for (int32 i = Min; i < Max; i++)
+			{
+				const FBuildingData& BuildingData = CurrentBuildingData[i];
+				if (BuildingData.VisualBoxCache.bIsValid && BuildingData.VisualBoxCache.Intersect(Area) && is_layer_shown(RuntimeConfig, BuildingData))
+				{
+					const TSoftObjectPtr<UTexture2D>* IconPath = get_icon(BuildingData);
+					draw_building(Canvas, BuildingData, IconPath ? IconPath->LoadSynchronous() : nullptr);
+				}
+			}
+			Canvas.Flush_GameThread();
+
+			// What ending a draw to a render target does, so it's read back the same way as the map's
+			ENQUEUE_RENDER_COMMAND(CartographExportMapQuarter)(
+				[Resource](FRHICommandListImmediate& RHICmdList)
+				{
+					TransitionAndCopyTexture(RHICmdList, Resource->GetRenderTargetTexture(), Resource->TextureRHI, {});
+				});
+
+			TArray<FColor> Pixels;
+			if (!Resource->ReadPixels(Pixels) || Pixels.Num() != RENDER_TEXTURE_SIZE * RENDER_TEXTURE_SIZE)
+			{
+				Ar.Log(TEXT("Couldn't read the map"));
+				return;
+			}
+			for (int32 Y = 0; Y < RENDER_TEXTURE_SIZE; Y++)
+			{
+				FMemory::Memcpy(&Image[(int64{ QuarterY } * RENDER_TEXTURE_SIZE + Y) * ImageSize + QuarterX * RENDER_TEXTURE_SIZE],
+					&Pixels[Y * RENDER_TEXTURE_SIZE], RENDER_TEXTURE_SIZE * sizeof(FColor));
+			}
+		}
 	}
 
 	const FString Path = FPaths::ConvertRelativePathToFull(FPaths::ScreenShotDir()
 		/ FString::Printf(TEXT("Cartograph %s.png"), *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H-%M-%S"))));
-	Ar.Logf(TEXT("Saving the map to %s"), *Path);
+	Ar.Logf(TEXT("Saving the map to %s, that takes a little while"), *Path);
 
-	// Compressing an 8K PNG takes seconds, so not on the game thread.
+	// Compressing a PNG this size takes a while, so not on the game thread.
 	// What does it is loaded here though, modules are only to be loaded on the game thread.
 	FModuleManager::Get().LoadModule(TEXT("ImageWrapper"));
-	UE::Tasks::Launch(UE_SOURCE_LOCATION, [Path, Width = RenderTarget->SizeX, Height = RenderTarget->SizeY, Pixels = MoveTemp(Pixels)]
+	UE::Tasks::Launch(UE_SOURCE_LOCATION, [Path, Size = ImageSize, Image = MoveTemp(Image)]
 		{
 			TArray64<uint8> Png;
-			FImageUtils::PNGCompressImageArray(Width, Height, TArrayView64<const FColor>{ Pixels.GetData(), Pixels.Num() }, Png);
+			FImageUtils::PNGCompressImageArray(Size, Size, TArrayView64<const FColor>{ Image.GetData(), Image.Num() }, Png);
 			if (Png.IsEmpty() || !FFileHelper::SaveArrayToFile(Png, *Path))
 			{
 				CARTO_LOG_ERROR("Failed to save the map: %s", *Path);
