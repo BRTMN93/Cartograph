@@ -358,10 +358,16 @@ void UCartographGameInstanceModule::OnWorldLoaded(UWorld* World)
 				TArray<TWeakObjectPtr<AFGBuildable>> Factories;
 				Algo::Transform(AFGBuildableSubsystem::Get(World)->GetAllBuildablesRef(), Factories,
 					[](AFGBuildable* Buildable) { return Buildable; });
-				Coroutine = InitialBuildableGather(
+				UE5Coro::TCoroutine<> Gather = InitialBuildableGather(
 					std::move(Factories),
 					AFGLightweightBuildableSubsystem::Get(World)->mBuildableClassToInstanceArray
 				);
+				// On a small save the gather can be done before it gets back here, and then the redraw
+				// it started at its end is the one running. Its handle must not be replaced by the gather's.
+				if (!Gather.IsDone())
+				{
+					Coroutine = std::move(Gather);
+				}
 			});
 	}
 
