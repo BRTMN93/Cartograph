@@ -189,6 +189,9 @@ public:
 
 	void OnLayerConfigChanged();
 
+	// The Cartograph.ExportMap console command
+	void ExportMap(FOutputDevice& Ar);
+
 	const FBuildLayerData* GetBuildLayerData(uint32 ClassHash);
 
 	bool DoesBuildingExist(uint32 ClassHash) const;
