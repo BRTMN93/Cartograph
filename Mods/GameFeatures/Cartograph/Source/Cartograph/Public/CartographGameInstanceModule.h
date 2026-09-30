@@ -366,7 +366,7 @@ protected:
 	bool IsInitializing = false;
 
 	UE5Coro::TCoroutine<> Coroutine = UE5Coro::TCoroutine<>::CompletedCoroutine;
-	FDrawToRenderTargetContext RenderContext;
+	// The map's own, while a redraw has it open
 	FCanvas* CurrentCanvas = nullptr;
 	TArray<FBuildingData> CurrentBuildingData;
 

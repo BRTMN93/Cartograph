@@ -20,6 +20,7 @@
 #include "Misc/Paths.h"
 #include "RenderingThread.h"
 #include "RHICommandList.h"
+#include "RHIUtilities.h"
 #include "Tasks/Task.h"
 #include "TextureResource.h"
 
@@ -634,10 +635,16 @@ UE5Coro::TCoroutine<> UCartographGameInstanceModule::RedrawMapCoroutine(
 	// My guess is because EndDraw and BeginDraw are called in the same frame, so I'm putting it here.
 	co_await UE5Coro::Latent::NextTick();
 
-	UCanvas* Canvas = nullptr;
-	FVector2D _;
-	UKismetRenderingLibrary::BeginDrawCanvasToRenderTarget(this, RenderTarget, Canvas, _, RenderContext);
-	CurrentCanvas = Canvas->Canvas;
+	// What BeginDrawCanvasToRenderTarget does, with a canvas of the map's own. That function hands out the world's canvas,
+	// shared by everything that draws to a render target, and a redraw keeps it over many frames. A draw in between
+	// replaced it, so the redraw's end never flushed or deleted the map's canvas, and deleted the other one if it was still open.
+	FTextureRenderTargetResource* RenderTargetResource = RenderTarget->GameThread_GetRenderTargetResource();
+	CurrentCanvas = new FCanvas(RenderTargetResource, nullptr, GetWorld(), GetWorld()->GetFeatureLevel(), FCanvas::CDM_ImmediateDrawing);
+	ENQUEUE_RENDER_COMMAND(CartographBeginMapDraw)(
+		[RenderTargetResource](FRHICommandListImmediate& RHICmdList)
+		{
+			RenderTargetResource->FlushDeferredResourceUpdate(RHICmdList);
+		});
 
 	if (IsRedrawingEntirely)
 	{
@@ -666,7 +673,7 @@ UE5Coro::TCoroutine<> UCartographGameInstanceModule::RedrawMapCoroutine(
 	};
 	ClearItem.BlendMode = SE_BLEND_Opaque;
 
-	Canvas->DrawItem(ClearItem);
+	CurrentCanvas->DrawItem(ClearItem);
 
 
     const int32 Min = Algo::LowerBound(CurrentBuildingData, MinZFilter);
@@ -896,12 +903,24 @@ void UCartographGameInstanceModule::OnCoroutineFinishedOrCancelled()
 {
     CARTO_LOG_DEBUG("OnCoroutineFinishedOrCancelled");
 
-    if (RenderContext.RenderTarget)
-    {
-        UKismetRenderingLibrary::EndDrawCanvasToRenderTarget(this, RenderContext);
-		RenderContext = {};
+	// What EndDrawCanvasToRenderTarget does, for the map's own canvas
+	if (CurrentCanvas)
+	{
+		CurrentCanvas->Flush_GameThread();
+		delete CurrentCanvas;
 		CurrentCanvas = nullptr;
-    }
+
+		FTextureRenderTargetResource* Resource = RenderTarget->GameThread_GetRenderTargetResource();
+		ENQUEUE_RENDER_COMMAND(CartographEndMapDraw)(
+			[Resource](FRHICommandListImmediate& RHICmdList)
+			{
+				// A multisampled one has been resolved by the canvas already
+				if (!Resource->GetRenderTargetTexture()->GetDesc().IsMultisample())
+				{
+					TransitionAndCopyTexture(RHICmdList, Resource->GetRenderTargetTexture(), Resource->TextureRHI, {});
+				}
+			});
+	}
 
 	if (!IsPendingRedraw)
 	{
