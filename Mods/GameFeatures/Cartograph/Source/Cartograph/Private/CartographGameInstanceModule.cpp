@@ -1331,20 +1331,22 @@ void UCartographGameInstanceModule::FillBuildLayerDataCache()
 
 void UCartographGameInstanceModule::OnBuildingDataAdd(const FBuildingData& AddedBuildingData, int32 Pos)
 {
+	// A building that isn't drawn still takes a slot in CurrentBuildingData, so the ones after it move either way.
+	// The initial data is added in sorted order, so there's nothing to shift
+	if (!IsInitializing)
+	{
+		for (int32& Index : BuildingDataIndexRedirector)
+		{
+			if (Index >= Pos)
+			{
+				Index++;
+			}
+		}
+	}
+
 	if (AddedBuildingData.VisualBoxCache.bIsValid)
 	{
 		CurrentBuildingQuadTree.Insert(BuildingDataIndexRedirector.Num(), AddedBuildingData.VisualBoxCache);
-		// The initial data is added in sorted order, so there's nothing to shift
-		if (!IsInitializing)
-		{
-			for (int32& Index : BuildingDataIndexRedirector)
-			{
-				if (Index >= Pos)
-				{
-					Index++;
-				}
-			}
-		}
 		BuildingDataIndexRedirector.Add(Pos);
 	}
 
@@ -1354,21 +1356,19 @@ void UCartographGameInstanceModule::OnBuildingDataAdd(const FBuildingData& Added
 
 void UCartographGameInstanceModule::OnBuildingDataRemove(const FBuildingData& RemovedBuildingData, int32 Pos)
 {
-	if (RemovedBuildingData.VisualBoxCache.bIsValid)
+	// Same as when adding, the ones after it move whether it's drawn or not
+	const int32 Num = BuildingDataIndexRedirector.Num();
+	for (int32 i = 0; i < Num; i++)
 	{
-		const int32 Num = BuildingDataIndexRedirector.Num();
-		for (int32 i = 0; i < Num; i++)
+		int32& BuildingDataArrayIndex = BuildingDataIndexRedirector[i];
+		if (BuildingDataArrayIndex == Pos)
 		{
-			int32& BuildingDataArrayIndex = BuildingDataIndexRedirector[i];
-			if (BuildingDataArrayIndex == Pos)
-			{
-				CurrentBuildingQuadTree.Remove(i, RemovedBuildingData.VisualBoxCache);
-				BuildingDataArrayIndex = -1;
-			}
-			else if (BuildingDataArrayIndex > Pos)
-			{
-				BuildingDataArrayIndex--;
-			}
+			CurrentBuildingQuadTree.Remove(i, RemovedBuildingData.VisualBoxCache);
+			BuildingDataArrayIndex = -1;
+		}
+		else if (BuildingDataArrayIndex > Pos)
+		{
+			BuildingDataArrayIndex--;
 		}
 	}
 
